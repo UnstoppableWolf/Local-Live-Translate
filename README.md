@@ -95,6 +95,11 @@ Optional (used to verify CUDA availability):
 pip install cupy-cuda12x
 faster-whisper will automatically use CUDA if available.
 ```
+
+```
+pip install noisereduce
+```
+
 LM Studio Setup (Required for Translation)
 1. Install LM Studio
 https://lmstudio.ai

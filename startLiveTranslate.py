@@ -9,14 +9,25 @@ import os
 import time
 import requests
 from faster_whisper import WhisperModel
+import torch
+
+# Try to import noisereduce for better noise suppression
+try:
+    import noisereduce as nr
+    NOISEREDUCE_AVAILABLE = True
+    print("noisereduce library loaded - advanced noise suppression enabled")
+except ImportError:
+    NOISEREDUCE_AVAILABLE = False
+    print("noisereduce not available - using basic noise filtering")
+    print("Install with: pip install noisereduce")
 
 # Real-time configuration for ultra-fast response
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 1024  # Larger chunks for better efficiency
 ENERGY_THRESHOLD = 0.001
 MODEL_SIZE = "medium"  # Medium model - best balance (769M parameters)
-LM_STUDIO_URL = "http://yourlocaliphere:1234/v1/chat/completions"
-LM_STUDIO_API_KEY = "" #create an api key and use it for this.
+LM_STUDIO_URL = "http://yourIPHERE:1234/v1/chat/completions"
+LM_STUDIO_API_KEY = "YOUR API KEY HERE"
 PREF_FILE = "mic_pref.json"
 
 # Real-time processing settings - truly live
@@ -54,10 +65,15 @@ class RealtimeTranslator:
         
         # Initialize variables for real-time processing
         self.model = None
+        self.silero_model = None  # Silero VAD model
+        self.silero_utils = None  # Silero utilities
         self.client = None
         self.stream = None
         self.current_level = 0.0
         self.is_running = True
+        self.mic_gain = 1.0  # Microphone gain multiplier
+        self.noise_profile = None  # For adaptive noise reduction
+        self.noise_sample_count = 0  # Count samples for noise profiling
         
         # Real-time audio processing
         self.audio_buffer = np.zeros(int(SAMPLE_RATE * ROLLING_WINDOW), dtype=np.float32)
@@ -124,6 +140,16 @@ class RealtimeTranslator:
         self.model_combo.bind("<<ComboboxSelected>>", self.on_model_change)
         self.model_combo.current(3)  # Default to Medium
         
+        # LLM Correction checkbox
+        self.llm_correction_var = tk.BooleanVar(value=False)
+        self.llm_correction_check = tk.Checkbutton(
+            model_frame, 
+            text="LLM Correction (slower, more accurate)", 
+            variable=self.llm_correction_var,
+            font=("Arial", 9)
+        )
+        self.llm_correction_check.grid(row=0, column=2, padx=10, sticky="w")
+        
         # Language selection frame
         lang_frame = tk.Frame(self.root)
         lang_frame.pack(fill="x", padx=10, pady=5)
@@ -182,6 +208,37 @@ class RealtimeTranslator:
                     break
             self.mic_combo.current(default_mic_index)
         
+        # Microphone gain slider
+        gain_frame = tk.Frame(self.root)
+        gain_frame.pack(fill="x", padx=10, pady=5)
+        
+        tk.Label(gain_frame, text="Mic Gain:", font=("Arial", 10, "bold")).pack(side="left", padx=(0, 5))
+        self.gain_slider = tk.Scale(
+            gain_frame,
+            from_=0.1,
+            to=2.0,
+            resolution=0.1,
+            orient="horizontal",
+            command=self.on_gain_change,
+            length=200
+        )
+        self.gain_slider.set(1.0)  # Default gain
+        self.gain_slider.pack(side="left", padx=5)
+        
+        self.gain_label = tk.Label(gain_frame, text="1.0x", font=("Arial", 9))
+        self.gain_label.pack(side="left", padx=5)
+        
+        # Noise suppression checkbox
+        self.noise_suppression_var = tk.BooleanVar(value=NOISEREDUCE_AVAILABLE)
+        self.noise_suppression_check = tk.Checkbutton(
+            gain_frame,
+            text="Noise Suppression" + (" ✓" if NOISEREDUCE_AVAILABLE else " (install noisereduce)"),
+            variable=self.noise_suppression_var,
+            font=("Arial", 9),
+            state="normal" if NOISEREDUCE_AVAILABLE else "disabled"
+        )
+        self.noise_suppression_check.pack(side="left", padx=10)
+        
         # Level bar
         tk.Label(self.root, text="Audio Level:", font=("Arial", 10, "bold")).pack()
         self.level_canvas = tk.Canvas(self.root, height=20, bg="black")
@@ -221,6 +278,30 @@ class RealtimeTranslator:
     def load_models(self):
         """Load AI models with optimized settings"""
         try:
+            # Load Silero VAD first (lightweight, fast)
+            ui_queue.put(("status", "Loading Silero VAD..."))
+            print("Loading Silero VAD model...")
+            
+            try:
+                # Load Silero VAD model
+                self.silero_model, self.silero_utils = torch.hub.load(
+                    repo_or_dir='snakers4/silero-vad',
+                    model='silero_vad',
+                    force_reload=False,
+                    onnx=False
+                )
+                
+                # Extract utility functions
+                (get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks) = self.silero_utils
+                
+                print("Silero VAD loaded successfully!")
+                ui_queue.put(("status", "Silero VAD loaded ✓"))
+            except Exception as e:
+                print(f"Warning: Could not load Silero VAD: {e}")
+                print("Continuing without Silero VAD (will use energy-based VAD only)")
+                self.silero_model = None
+                self.silero_utils = None
+            
             ui_queue.put(("status", f"Loading Whisper {MODEL_SIZE} model..."))
             print(f"Loading Whisper {MODEL_SIZE} model...")
             
@@ -267,6 +348,7 @@ class RealtimeTranslator:
             
             print(f"Model loaded successfully on {device.upper()}!")
             
+            silero_status = " + Silero VAD" if self.silero_model else ""
             ui_queue.put(("status", "Connecting to LM Studio..."))
             try:
                 response = requests.post(
@@ -284,10 +366,10 @@ class RealtimeTranslator:
                     timeout=5
                 )
                 if response.status_code == 200:
-                    ui_queue.put(("status", f"Ready! {MODEL_SIZE} on {device.upper()}."))
+                    ui_queue.put(("status", f"Ready! {MODEL_SIZE} on {device.upper()}{silero_status}"))
                     print(f"System ready!")
                 else:
-                    ui_queue.put(("status", f"LM Studio connected"))
+                    ui_queue.put(("status", f"LM Studio connected{silero_status}"))
             except Exception as e:
                 ui_queue.put(("status", f"LM Studio warning: {e}"))
                 
@@ -364,6 +446,10 @@ class RealtimeTranslator:
                 return
             
             audio = indata[:, 0]
+            
+            # Apply microphone gain
+            audio = audio * self.mic_gain
+            
             current_time = time.time()
             
             # Apply noise reduction
@@ -459,7 +545,37 @@ class RealtimeTranslator:
     def apply_noise_reduction(self, audio):
         """Apply noise reduction and filtering"""
         try:
-            # Simple noise gate
+            # Use noisereduce if available and enabled
+            if NOISEREDUCE_AVAILABLE and self.noise_suppression_var.get():
+                # Build noise profile from initial silence if not yet built
+                if self.noise_profile is None and self.noise_sample_count < 10:
+                    # Collect first few samples as noise profile
+                    if not self.is_speaking:
+                        if self.noise_profile is None:
+                            self.noise_profile = audio.copy()
+                        else:
+                            self.noise_profile = np.concatenate([self.noise_profile, audio])
+                        self.noise_sample_count += 1
+                        
+                        if self.noise_sample_count >= 10:
+                            print("Noise profile built from background samples")
+                
+                # Apply stationary noise reduction
+                if len(audio) > 512:  # Need minimum length
+                    try:
+                        # Use stationary noise reduction (faster, works well for constant background noise)
+                        reduced = nr.reduce_noise(
+                            y=audio,
+                            sr=SAMPLE_RATE,
+                            stationary=True,
+                            prop_decrease=0.8  # Reduce noise by 80%
+                        )
+                        return reduced
+                    except Exception as e:
+                        print(f"Noisereduce error: {e}")
+                        # Fall through to basic filtering
+            
+            # Basic noise gate (fallback or if noisereduce disabled)
             audio_filtered = np.where(np.abs(audio) > self.noise_level, audio, 0)
             
             # Simple high-pass filter to remove low-frequency noise
@@ -477,6 +593,133 @@ class RealtimeTranslator:
         except Exception as e:
             print(f"Noise reduction error: {e}")
             return audio
+
+    def check_speech_with_silero(self, audio_chunk):
+        """Use Silero VAD to check if audio contains speech"""
+        if self.silero_model is None:
+            return True  # If Silero not available, assume speech (fallback to energy VAD)
+        
+        try:
+            # Silero expects exactly 512 samples at 16kHz
+            chunk_size = 512
+            
+            # If audio is shorter than 512 samples, pad it
+            if len(audio_chunk) < chunk_size:
+                audio_chunk = np.pad(audio_chunk, (0, chunk_size - len(audio_chunk)), mode='constant')
+            
+            # For speed, sample only a few chunks instead of processing all
+            # Process beginning, middle, and end chunks
+            num_chunks = len(audio_chunk) // chunk_size
+            
+            if num_chunks <= 3:
+                # Short audio, check all chunks
+                chunks_to_check = range(0, len(audio_chunk), chunk_size)
+            else:
+                # Long audio, sample 5 chunks evenly distributed
+                step = num_chunks // 5
+                chunks_to_check = [i * chunk_size for i in range(0, num_chunks, max(1, step))][:5]
+            
+            speech_probs = []
+            for i in chunks_to_check:
+                chunk = audio_chunk[i:i+chunk_size]
+                
+                # Pad last chunk if needed
+                if len(chunk) < chunk_size:
+                    chunk = np.pad(chunk, (0, chunk_size - len(chunk)), mode='constant')
+                
+                # Convert to torch tensor
+                audio_tensor = torch.from_numpy(chunk).float()
+                
+                # Get speech probability (0.0 to 1.0)
+                speech_prob = self.silero_model(audio_tensor, SAMPLE_RATE).item()
+                speech_probs.append(speech_prob)
+            
+            # Use max speech probability (if ANY chunk has speech, consider it speech)
+            max_speech_prob = np.max(speech_probs)
+            
+            # Threshold: 0.2 means 20% confidence of speech (very lenient for better detection)
+            speech_threshold = 0.2
+            
+            has_speech = max_speech_prob > speech_threshold
+            
+            if has_speech:
+                print(f"Silero VAD: Speech detected (confidence: {max_speech_prob:.2f})")
+            else:
+                print(f"Silero VAD: No speech (confidence: {max_speech_prob:.2f})")
+            
+            return has_speech
+            
+        except Exception as e:
+            print(f"Silero VAD error: {e}")
+            return True  # On error, assume speech (fallback)
+
+    def get_initial_prompt(self):
+        """Get initial prompt to guide Whisper transcription"""
+        # Get current language
+        from_index = self.from_language_combo.current()
+        if from_index >= 0:
+            language_code = self.languages[from_index]["code"]
+        else:
+            language_code = "zh"
+        
+        # Language-specific prompts to improve accuracy
+        prompts = {
+            "zh": "以下是普通话的句子。",  # "The following is a Mandarin sentence."
+            "ru": "Следующее предложение на русском языке.",  # "The following sentence is in Russian."
+            "en": "The following is a clear English sentence."
+        }
+        
+        return prompts.get(language_code, "")
+
+    def correct_transcription_with_llm(self, text, language):
+        """Use LLM to correct transcription errors"""
+        if not text or len(text.strip()) < 2:
+            return text
+        
+        try:
+            print(f"LLM correction: Correcting '{text}'")
+            
+            # Create correction prompt
+            correction_prompts = {
+                "zh": f"Correct any transcription errors in this Chinese text. Output ONLY the corrected text, nothing else:\n{text}",
+                "ru": f"Correct any transcription errors in this Russian text. Output ONLY the corrected text, nothing else:\n{text}",
+                "en": f"Correct any transcription errors in this English text. Output ONLY the corrected text, nothing else:\n{text}"
+            }
+            
+            prompt = correction_prompts.get(language, f"Correct any errors in: {text}")
+            
+            # Quick LLM correction
+            response = requests.post(
+                LM_STUDIO_URL,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {LM_STUDIO_API_KEY}"
+                },
+                json={
+                    "model": "local-model",
+                    "messages": [
+                        {"role": "system", "content": "You are a transcription correction assistant. Output ONLY the corrected text."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "stream": False,
+                    "max_tokens": 200,
+                    "temperature": 0.1
+                },
+                timeout=5
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                if 'choices' in result and len(result['choices']) > 0:
+                    corrected = result['choices'][0]['message']['content'].strip()
+                    print(f"LLM correction result: '{corrected}'")
+                    return corrected
+            
+            return text  # Return original if correction fails
+            
+        except Exception as e:
+            print(f"LLM correction error: {e}")
+            return text  # Return original on error
 
     def update_noise_estimation(self, rms):
         """Update background noise estimation"""
@@ -515,11 +758,11 @@ class RealtimeTranslator:
             
             # Additional check: energy must also be above absolute minimum
             # This prevents triggering on slight noise increases
-            absolute_minimum = VAD_ENERGY_THRESHOLD * 1.2  # Increased from 0.8 to be more strict
+            absolute_minimum = VAD_ENERGY_THRESHOLD * 0.8  # Lowered from 1.2 to be less strict
             speech_detected = speech_detected and (smoothed_energy > absolute_minimum)
             
             # Fallback: also detect if energy is significantly above noise floor
-            fallback_detected = smoothed_energy > (self.noise_level * 3.0)  # Increased from 2.0 to 3.0
+            fallback_detected = smoothed_energy > (self.noise_level * 2.5)  # Lowered from 3.0 to 2.5
             
             # Use either detection method, but prefer the stricter one
             if speech_detected or fallback_detected:
@@ -575,7 +818,15 @@ class RealtimeTranslator:
             "happy", "радостные", "so lan ya", "down to earth",
             "downed", "once down", "coconut egg", "ten dollars",
             "scared you", "he scared", "subtitles by",
-            "字幕", "索兰娅", "索蘭婭", "字幕by"  # Chinese subtitle artifacts
+            "字幕", "索兰娅", "索蘭婭", "字幕by",
+            "谢谢观看", "謝謝觀看", "thank you for watching", "thanks for watching",
+            "视频就到此为止", "視頻就到此為止", "this is where the video ends",
+            "下期再见", "下期見", "see you next time",
+            "lyrics by", "歌词", "請按讚", "请按赞", "like, subscribe", "share",
+            "support the", "明镜", "点点", "mingjing", "dian dian",
+            "李宗恒", "李宗盛", "li zongheng", "li zongsheng", "burp",
+            "the following is", "以下是普通话", "以下是", "mandarin chinese",
+            "clear english sentence", "следующее предложение"
         ]
         
         # Convert to lowercase for checking (and check original for Chinese)
@@ -584,14 +835,15 @@ class RealtimeTranslator:
         # Skip if contains subtitle keywords (check both cases)
         for keyword in subtitle_keywords:
             if keyword in text_lower or keyword in text:
+                print(f"Filtered out common video/spam phrase: '{keyword}'")
                 return ""
         
         # Skip if text looks like subtitle formatting
-        if any(phrase in text_lower for phrase in ["subtitles by", "down to earth", "coconut egg"]):
+        if any(phrase in text_lower for phrase in ["subtitles by", "down to earth", "coconut egg", "lyrics by"]):
             return ""
         
-        # Skip Chinese subtitle patterns
-        if any(phrase in text for phrase in ["字幕by", "索兰娅", "索蘭婭"]):
+        # Skip Chinese subtitle patterns or video ending phrases
+        if any(phrase in text for phrase in ["字幕by", "索兰娅", "索蘭婭", "谢谢观看", "視頻就到此為止", "請按讚", "明镜"]):
             return ""
         
         # Get current language
@@ -921,36 +1173,61 @@ class RealtimeTranslator:
                 print(f"Transcribing with language: {language_code}")
                 
                 # Normalize audio with better preprocessing and amplification
+                audio_chunk_original = audio_chunk.copy()  # Keep original for Silero
+                
                 if np.max(np.abs(audio_chunk)) > 0:
                     # Normalize to -1 to 1 range
                     audio_chunk = audio_chunk / np.max(np.abs(audio_chunk))
-                    # Apply stronger amplification for better detection (increased from 1.2 to 1.5)
-                    audio_chunk = np.clip(audio_chunk * 1.5, -1.0, 1.0)
+                    
+                    # Apply pre-emphasis filter to boost high frequencies (improves speech clarity)
+                    pre_emphasis = 0.97
+                    audio_chunk = np.append(audio_chunk[0], audio_chunk[1:] - pre_emphasis * audio_chunk[:-1])
+                    
+                    # Apply amplification for better detection
+                    audio_chunk = np.clip(audio_chunk * 1.8, -1.0, 1.0)
                 
                 # Calculate audio energy to detect if this is mostly silence/noise
                 audio_energy = np.sqrt(np.mean(audio_chunk**2))
                 audio_duration = len(audio_chunk) / SAMPLE_RATE
                 
                 # If audio energy is very low, skip transcription (likely just background noise)
-                if audio_energy < 0.02:  # Very low energy threshold
+                if audio_energy < 0.02:  # Increased back to 0.02 to be more strict
                     print(f"Audio energy too low ({audio_energy:.4f}), skipping transcription (likely background noise)")
                     continue
                 
-                # Optimized transcription settings - batch processing is faster
+                # SILERO VAD CHECK: Use ML model to verify speech presence (use ORIGINAL audio, not pre-emphasized)
+                # Only check Silero if energy is borderline - if energy is high, trust it
+                if audio_energy < 0.08:  # Increased from 0.05 - use Silero for more cases
+                    if not self.check_speech_with_silero(audio_chunk_original):
+                        print("Silero VAD: No speech detected, skipping transcription")
+                        continue
+                else:
+                    print(f"High energy detected ({audio_energy:.4f}), bypassing Silero VAD")
+                
+                # Get initial prompt for better context (helps with accuracy)
+                # Disabled - prompts were leaking into transcription output
+                initial_prompt = None  # Was causing "The following is..." to appear in output
+                
+                # Optimized transcription settings - balanced speed and accuracy
                 gpu_start = time.time()
                 segments, info = self.model.transcribe(
                     audio_chunk,
                     language=language_code,
-                    beam_size=5,  # Better accuracy, batched efficiently
-                    temperature=0.0,
+                    beam_size=5,  # Reduced from 10 - good balance (5 is sweet spot)
+                    best_of=1,     # Disabled - was causing multiple versions (changed from 5)
+                    temperature=0.0,  # Single temperature for speed (was multiple)
                     vad_filter=True,
                     vad_parameters=dict(
-                        threshold=0.5,
-                        min_speech_duration_ms=250,
+                        threshold=0.6,  # Increased from 0.5 - more strict
+                        min_speech_duration_ms=300,  # Increased from 250
                         min_silence_duration_ms=500
                     ),
-                    condition_on_previous_text=False,
-                    no_speech_threshold=0.7,  # Increased from 0.6 to be more strict
+                    condition_on_previous_text=False,  # Disabled - prevents hallucinations
+                    initial_prompt=initial_prompt,     # Keep - helps guide model
+                    no_speech_threshold=0.8,  # Increased from 0.7 - much more strict
+                    compression_ratio_threshold=2.4,   # Keep - prevents hallucinations
+                    log_prob_threshold=-0.8,           # Increased from -1.0 - reject lower confidence
+                    no_repeat_ngram_size=3,            # Prevent repeating 3-grams
                     word_timestamps=False
                 )
                 gpu_time = time.time() - gpu_start
@@ -967,6 +1244,12 @@ class RealtimeTranslator:
                     print(f"Raw segment text: '{text}'")
                     if text and len(text) > 0:
                         total_segment_text_length += len(text)
+                        
+                        # Apply LLM correction if enabled
+                        if self.llm_correction_var.get():
+                            text = self.correct_transcription_with_llm(text, language_code)
+                            print(f"After LLM correction: '{text}'")
+                        
                         # Apply only basic cleaning
                         cleaned_text = self.clean_transcribed_text(text)
                         print(f"Cleaned text: '{cleaned_text}'")
@@ -1020,6 +1303,22 @@ class RealtimeTranslator:
                             if new_lower in last_lower:
                                 print(f"New text is subset of last text, skipping")
                                 continue
+                        
+                        # Check if last text is a subset of new text (new is longer version)
+                        if last_lower and len(last_lower) < len(new_lower):
+                            if last_lower in new_lower:
+                                print(f"Last text is subset of new text, skipping (likely variation)")
+                                continue
+                        
+                        # Check for very similar text (>70% word overlap)
+                        if last_lower and len(last_lower) > 5 and len(new_lower) > 5:
+                            last_words = set(last_lower.split())
+                            new_words = set(new_lower.split())
+                            if last_words and new_words:
+                                overlap = len(last_words & new_words) / max(len(last_words), len(new_words))
+                                if overlap > 0.7:
+                                    print(f"Text too similar to last ({overlap*100:.0f}% overlap), skipping")
+                                    continue
                         
                         # Check for word-level duplication (e.g., "penis penis")
                         new_words = new_lower.split()
@@ -1393,6 +1692,15 @@ class RealtimeTranslator:
                     print(f"Error closing stream: {e}")
                 self.stream = None
             
+            # Validate selected device
+            device_index = self.mic_combo.current()
+            if device_index >= 0 and device_index < len(self.mics):
+                device_info = self.mics[device_index]
+                if device_info['max_input_channels'] < 1:
+                    ui_queue.put(("status", "Selected device has no input channels!"))
+                    print(f"Error: Device {device_index} has no input channels")
+                    return
+            
             # Start new stream after a short delay
             time.sleep(0.5)
             threading.Thread(target=self.start_audio_stream, daemon=True).start()
@@ -1400,6 +1708,15 @@ class RealtimeTranslator:
         except Exception as e:
             print(f"Mic change error: {e}")
             ui_queue.put(("status", f"Mic change error: {e}"))
+
+    def on_gain_change(self, value):
+        """Handle microphone gain change"""
+        try:
+            self.mic_gain = float(value)
+            self.gain_label.config(text=f"{self.mic_gain:.1f}x")
+            print(f"Mic gain set to: {self.mic_gain:.1f}x")
+        except Exception as e:
+            print(f"Gain change error: {e}")
 
     def is_repetitive_or_spam(self, text):
         """Check if text is repetitive or spam"""
