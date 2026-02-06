@@ -15,8 +15,8 @@ SAMPLE_RATE = 16000
 CHUNK_SIZE = 1024  # Larger chunks for better efficiency
 ENERGY_THRESHOLD = 0.001
 MODEL_SIZE = "medium"  # Medium model - best balance (769M parameters)
-LM_STUDIO_URL = "http://192.168.1.208:1234/v1/chat/completions"
-LM_STUDIO_API_KEY = "sk-lm-xCIDFvdn:Iy8t1zs1vhqrkT0t4i2e"
+LM_STUDIO_URL = "http://yourlocaliphere:1234/v1/chat/completions"
+LM_STUDIO_API_KEY = "" #create an api key and use it for this.
 PREF_FILE = "mic_pref.json"
 
 # Real-time processing settings - truly live
