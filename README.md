@@ -90,7 +90,7 @@ Install required packages:
 
 ```bash
 pip install sounddevice numpy requests faster-whisper torch torchvision torchaudio
-Optional (used to verify CUDA availability):
+(used to verify CUDA availability):
 
 pip install cupy-cuda12x
 faster-whisper will automatically use CUDA if available.
