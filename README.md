@@ -100,6 +100,10 @@ faster-whisper will automatically use CUDA if available.
 pip install noisereduce
 ```
 
+```
+choco install ffmpeg
+```
+
 LM Studio Setup (Required for Translation)
 1. Install LM Studio
 https://lmstudio.ai

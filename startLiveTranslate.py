@@ -6,10 +6,33 @@ import threading
 import queue
 import json
 import os
+import sys
 import time
 import requests
 from faster_whisper import WhisperModel
 import torch
+import subprocess
+import base64
+import io
+
+# Auto-install dependencies if needed
+def install_package(package_name, import_name=None):
+    """Install a package if it's not available"""
+    if import_name is None:
+        import_name = package_name
+    
+    try:
+        __import__(import_name)
+        return True
+    except ImportError:
+        print(f"Installing {package_name}...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
+            print(f"{package_name} installed successfully!")
+            return True
+        except Exception as e:
+            print(f"Failed to install {package_name}: {e}")
+            return False
 
 # Try to import noisereduce for better noise suppression
 try:
@@ -21,13 +44,30 @@ except ImportError:
     print("noisereduce not available - using basic noise filtering")
     print("Install with: pip install noisereduce")
 
+# Try to import Flask for web server
+try:
+    from flask import Flask, render_template_string, jsonify, request
+    from flask_cors import CORS
+    FLASK_AVAILABLE = True
+    print("Flask available - web server enabled")
+except ImportError:
+    print("Flask not available - installing...")
+    if install_package("flask") and install_package("flask-cors"):
+        from flask import Flask, render_template_string, jsonify, request
+        from flask_cors import CORS
+        FLASK_AVAILABLE = True
+        print("Flask installed and loaded!")
+    else:
+        FLASK_AVAILABLE = False
+        print("Web server disabled - Flask installation failed")
+
 # Real-time configuration for ultra-fast response
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 1024  # Larger chunks for better efficiency
 ENERGY_THRESHOLD = 0.001
 MODEL_SIZE = "medium"  # Medium model - best balance (769M parameters)
-LM_STUDIO_URL = "http://yourIPHERE:1234/v1/chat/completions"
-LM_STUDIO_API_KEY = "YOUR API KEY HERE"
+LM_STUDIO_URL = "http://youripaddresshere:1234/v1/chat/completions"
+LM_STUDIO_API_KEY = "YOURAPIKEYHERE"
 PREF_FILE = "mic_pref.json"
 
 # Real-time processing settings - truly live
@@ -42,10 +82,10 @@ MAX_SOURCE_TEXT_LENGTH = 500  # Auto-clear source text after this many character
 MAX_TRANSLATION_TEXT_LENGTH = 800  # Auto-clear translation after this many characters
 
 # Voice Activity Detection - less sensitive (increased by 0.3)
-VAD_ENERGY_THRESHOLD = 0.0008  # Increased from 0.0005 (0.3 less sensitive)
+VAD_ENERGY_THRESHOLD = 0.0005  # Lowered from 0.0008 (more sensitive)
 VAD_SILENCE_DURATION = 0.4  # Very quick end detection (was 0.5)
-VAD_SPEECH_DURATION = 0.3   # Increased from 0.2 (0.3 less sensitive)
-VAD_NOISE_GATE = 0.0002     # Increased from 0.0001 (0.3 less sensitive)
+VAD_SPEECH_DURATION = 0.2   # Lowered from 0.3 (more sensitive)
+VAD_NOISE_GATE = 0.0001     # Lowered from 0.0002 (more sensitive)
 VAD_SMOOTHING_WINDOW = 2
 
 # Real-time queues with higher throughput
@@ -53,6 +93,14 @@ audio_queue = queue.Queue(maxsize=10)  # Reduced from 100 to prevent backlog
 ui_queue = queue.Queue(maxsize=200)
 translate_queue = queue.Queue(maxsize=50)
 level_queue = queue.Queue(maxsize=30)
+
+# Web server queues for broadcasting
+web_source_queue = queue.Queue(maxsize=50)
+web_translation_queue = queue.Queue(maxsize=50)
+web_clients = []  # List of connected web clients
+web_audio_queue = queue.Queue(maxsize=50)  # Queue for web microphone audio
+web_current_translation = ""  # Store current translation for persistent access
+web_current_source = ""  # Store current source text
 
 class RealtimeTranslator:
     def __init__(self):
@@ -74,6 +122,12 @@ class RealtimeTranslator:
         self.mic_gain = 1.0  # Microphone gain multiplier
         self.noise_profile = None  # For adaptive noise reduction
         self.noise_sample_count = 0  # Count samples for noise profiling
+        
+        # Web server
+        self.web_server = None
+        self.web_server_thread = None
+        self.web_server_enabled = False
+        self.web_is_active = False  # Track if web client is speaking
         
         # Real-time audio processing
         self.audio_buffer = np.zeros(int(SAMPLE_RATE * ROLLING_WINDOW), dtype=np.float32)
@@ -239,6 +293,18 @@ class RealtimeTranslator:
         )
         self.noise_suppression_check.pack(side="left", padx=10)
         
+        # Web server checkbox
+        self.web_server_var = tk.BooleanVar(value=False)
+        self.web_server_check = tk.Checkbutton(
+            self.root,
+            text="Host Translation Web Server (http://0.0.0.0:1235)" + (" ✓" if FLASK_AVAILABLE else " (installing Flask...)"),
+            variable=self.web_server_var,
+            font=("Arial", 10, "bold"),
+            command=self.toggle_web_server,
+            state="normal" if FLASK_AVAILABLE else "disabled"
+        )
+        self.web_server_check.pack(pady=5)
+        
         # Level bar
         tk.Label(self.root, text="Audio Level:", font=("Arial", 10, "bold")).pack()
         self.level_canvas = tk.Canvas(self.root, height=20, bg="black")
@@ -271,6 +337,9 @@ class RealtimeTranslator:
         
         # Single translation thread
         threading.Thread(target=self.realtime_translation, daemon=True).start()
+        
+        # Web audio translation thread
+        threading.Thread(target=self.web_audio_translation, daemon=True).start()
         
         # Level processing
         threading.Thread(target=self.process_audio_levels, daemon=True).start()
@@ -443,6 +512,10 @@ class RealtimeTranslator:
                 print(f"Audio status: {status}")
             
             if indata is None or len(indata) == 0:
+                return
+            
+            # Skip PC audio processing if web client is active
+            if self.web_is_active:
                 return
             
             audio = indata[:, 0]
@@ -637,8 +710,8 @@ class RealtimeTranslator:
             # Use max speech probability (if ANY chunk has speech, consider it speech)
             max_speech_prob = np.max(speech_probs)
             
-            # Threshold: 0.2 means 20% confidence of speech (very lenient for better detection)
-            speech_threshold = 0.2
+            # Threshold: 0.15 means 15% confidence of speech (very lenient for better detection)
+            speech_threshold = 0.15
             
             has_speech = max_speech_prob > speech_threshold
             
@@ -758,11 +831,11 @@ class RealtimeTranslator:
             
             # Additional check: energy must also be above absolute minimum
             # This prevents triggering on slight noise increases
-            absolute_minimum = VAD_ENERGY_THRESHOLD * 0.8  # Lowered from 1.2 to be less strict
+            absolute_minimum = VAD_ENERGY_THRESHOLD * 0.5  # Lowered from 0.8 to be more sensitive
             speech_detected = speech_detected and (smoothed_energy > absolute_minimum)
             
             # Fallback: also detect if energy is significantly above noise floor
-            fallback_detected = smoothed_energy > (self.noise_level * 2.5)  # Lowered from 3.0 to 2.5
+            fallback_detected = smoothed_energy > (self.noise_level * 2.0)  # Lowered from 2.5 to 2.0
             
             # Use either detection method, but prefer the stricter one
             if speech_detected or fallback_detected:
@@ -1191,13 +1264,13 @@ class RealtimeTranslator:
                 audio_duration = len(audio_chunk) / SAMPLE_RATE
                 
                 # If audio energy is very low, skip transcription (likely just background noise)
-                if audio_energy < 0.02:  # Increased back to 0.02 to be more strict
+                if audio_energy < 0.01:  # Lowered from 0.02 to be more sensitive
                     print(f"Audio energy too low ({audio_energy:.4f}), skipping transcription (likely background noise)")
                     continue
                 
                 # SILERO VAD CHECK: Use ML model to verify speech presence (use ORIGINAL audio, not pre-emphasized)
                 # Only check Silero if energy is borderline - if energy is high, trust it
-                if audio_energy < 0.08:  # Increased from 0.05 - use Silero for more cases
+                if audio_energy < 0.1:  # Increased from 0.08 - use Silero for more cases
                     if not self.check_speech_with_silero(audio_chunk_original):
                         print("Silero VAD: No speech detected, skipping transcription")
                         continue
@@ -1834,11 +1907,1386 @@ class RealtimeTranslator:
         except Exception as e:
             print(f"Level bar error: {e}")
 
+    def toggle_web_server(self):
+        """Toggle web server on/off"""
+        if self.web_server_var.get():
+            self.start_web_server()
+        else:
+            self.stop_web_server()
+
+    def web_audio_translation(self):
+        """Process web microphone audio and translate"""
+        accumulated_text = ""
+        last_translation_time = 0
+        screen_accumulated_text = ""  # Separate accumulator for screen share
+        last_activity_time = time.time()
+        
+        while self.is_running:
+            try:
+                # Get web audio text from queue
+                data = web_audio_queue.get(timeout=0.5)
+                text = data.get('text', '')
+                from_lang = data.get('from_lang', 'zh')
+                to_lang = data.get('to_lang', 'en')
+                is_screen = data.get('is_screen', False)
+                
+                if not text:
+                    continue
+                
+                # Mark web as active (pause PC audio)
+                self.web_is_active = True
+                last_activity_time = time.time()
+                
+                # For screen share, use the text directly without accumulation
+                # This ensures each chunk is translated independently
+                if is_screen:
+                    accumulated_text = text.strip()
+                    print(f"Screen share text (no accumulation): '{accumulated_text}'")
+                else:
+                    # For web microphone, accumulate text
+                    accumulated_text += " " + text
+                    accumulated_text = accumulated_text.strip()
+                    print(f"Web mic text accumulated: '{accumulated_text}'")
+                
+                # Translate immediately (real-time)
+                current_time = time.time()
+                
+                # For screen share, don't throttle - translate every chunk
+                # For web mic, throttle to every 0.5 seconds
+                if not is_screen and (current_time - last_translation_time < 0.5):
+                    continue
+                
+                last_translation_time = current_time
+                
+                print(f"Translating {'screen' if is_screen else 'web mic'} text: '{accumulated_text}' from {from_lang} to {to_lang}")
+                
+                # Get language names
+                lang_map = {'zh': 'Chinese', 'ru': 'Russian', 'en': 'English'}
+                source_language = lang_map.get(from_lang, 'Chinese')
+                target_language = lang_map.get(to_lang, 'English')
+                
+                # Translate using LM Studio
+                try:
+                    response = requests.post(
+                        LM_STUDIO_URL,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {LM_STUDIO_API_KEY}"
+                        },
+                        json={
+                            "model": "local-model",
+                            "messages": [
+                                {"role": "system", "content": f"Translate {source_language} to {target_language}. Be concise and natural. Output only the translation."},
+                                {"role": "user", "content": accumulated_text}
+                            ],
+                            "stream": False,
+                            "max_tokens": 200,
+                            "temperature": 0.1
+                        },
+                        timeout=10
+                    )
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        if 'choices' in result and len(result['choices']) > 0:
+                            translation = result['choices'][0]['message']['content'].strip()
+                            print(f"{'Screen' if is_screen else 'Web mic'} translation result: '{translation}'")
+                            
+                            # Store globally for persistent access
+                            global web_current_translation, web_current_source
+                            web_current_translation = translation
+                            web_current_source = accumulated_text
+                            
+                            # Clear old translations and add new one
+                            while not web_translation_queue.empty():
+                                try:
+                                    web_translation_queue.get_nowait()
+                                except queue.Empty:
+                                    break
+                            
+                            # Put new translation
+                            web_translation_queue.put_nowait(translation)
+                            print(f"Translation queued for web display")
+                            
+                            # For screen share, clear accumulated text after translation
+                            # This ensures each chunk is independent
+                            if is_screen:
+                                screen_accumulated_text = ""
+                                print("Screen accumulator cleared for next chunk")
+                    else:
+                        print(f"Translation API error: {response.status_code}")
+                        web_translation_queue.put_nowait(f"[Translation Error: {response.status_code}]")
+                        
+                except requests.exceptions.Timeout:
+                    print(f"Web translation timeout")
+                    web_translation_queue.put_nowait("[Translation Timeout]")
+                except Exception as e:
+                    print(f"Web translation error: {e}")
+                    web_translation_queue.put_nowait(f"[Error: {str(e)}]")
+                    
+            except queue.Empty:
+                # Only mark inactive after 5 seconds of no activity (not 0.5s)
+                if self.web_is_active:
+                    current_time = time.time()
+                    if current_time - last_activity_time > 5.0:
+                        print("Web client inactive for 5s - resuming PC audio")
+                        self.web_is_active = False
+                        accumulated_text = ""  # Reset for next session
+                        screen_accumulated_text = ""  # Reset screen accumulator
+                continue
+            except Exception as e:
+                print(f"Web audio translation thread error: {e}")
+                import traceback
+                traceback.print_exc()
+
+    def start_web_server(self):
+        """Start the Flask web server"""
+        if not FLASK_AVAILABLE:
+            print("Flask not available, cannot start web server")
+            self.web_server_var.set(False)
+            return
+        
+        if self.web_server_enabled:
+            print("Web server already running")
+            return
+        
+        print("Starting web server on http://0.0.0.0:1235")
+        self.web_server_enabled = True
+        
+        # Start web server in separate thread
+        self.web_server_thread = threading.Thread(target=self.run_web_server, daemon=True)
+        self.web_server_thread.start()
+        
+        ui_queue.put(("status", "Web server started on http://0.0.0.0:1235"))
+
+    def stop_web_server(self):
+        """Stop the Flask web server"""
+        if not self.web_server_enabled:
+            return
+        
+        print("Stopping web server...")
+        self.web_server_enabled = False
+        
+        # Try to shutdown Flask gracefully
+        try:
+            # Send shutdown request to Flask
+            requests.post('http://127.0.0.1:1235/shutdown', timeout=2)
+        except:
+            pass
+        
+        ui_queue.put(("status", "Web server stopped"))
+
+    def run_web_server(self):
+        """Run Flask web server"""
+        app = Flask(__name__)
+        CORS(app)  # Enable CORS for cross-origin requests
+        
+        # HTML template for the web interface
+        HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Real-time Voice Translator</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        .status {
+            text-align: center;
+            padding: 10px;
+            background: #4CAF50;
+            color: white;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        .mode-selector {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        .mode-button {
+            padding: 12px 24px;
+            margin: 0 10px;
+            border: 2px solid #2196F3;
+            background: white;
+            color: #2196F3;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: bold;
+            transition: all 0.3s;
+        }
+        .mode-button:hover {
+            background: #E3F2FD;
+        }
+        .mode-button.active {
+            background: #2196F3;
+            color: white;
+        }
+        .controls {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .control-group {
+            margin: 10px 0;
+        }
+        label {
+            font-weight: bold;
+            margin-right: 10px;
+        }
+        select {
+            padding: 5px 10px;
+            border-radius: 4px;
+            border: 1px solid #ddd;
+        }
+        .mic-control {
+            text-align: center;
+            margin: 20px 0;
+        }
+        .mic-button {
+            padding: 20px 40px;
+            font-size: 18px;
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: bold;
+        }
+        .mic-button.inactive {
+            background: #4CAF50;
+            color: white;
+        }
+        .mic-button.inactive:hover {
+            background: #45a049;
+        }
+        .mic-button.active {
+            background: #f44336;
+            color: white;
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+        }
+        .text-box {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            min-height: 150px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .text-box h2 {
+            margin-top: 0;
+            color: #555;
+        }
+        .source-text {
+            border-left: 4px solid #2196F3;
+        }
+        .translation-text {
+            border-left: 4px solid #4CAF50;
+        }
+        .text-content {
+            font-size: 16px;
+            line-height: 1.6;
+            color: #333;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        .footer {
+            text-align: center;
+            color: #777;
+            margin-top: 20px;
+        }
+        .warning {
+            background: #fff3cd;
+            border: 1px solid #ffc107;
+            padding: 10px;
+            border-radius: 5px;
+            margin: 10px 0;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <h1>🎤 Real-time Voice Translator</h1>
+    
+    <div class="status" id="status">
+        Connecting to server...
+    </div>
+    
+    <div class="mode-selector">
+        <h3>Select Mode:</h3>
+        <button class="mode-button active" id="watchMode" onclick="setMode('watch')">
+            👀 Watch Mode (View PC Transcription)
+        </button>
+        <button class="mode-button" id="speakMode" onclick="setMode('speak')">
+            🎤 Speak Mode (Use Web Microphone)
+        </button>
+        <button class="mode-button" id="typeMode" onclick="setMode('type')">
+            ⌨️ Type Mode (Text Translation)
+        </button>
+        <button class="mode-button" id="screenMode" onclick="setMode('screen')">
+            🖥️ Screen Share (Capture Tab Audio)
+        </button>
+    </div>
+    
+    <div class="controls">
+        <div class="control-group">
+            <label>From Language:</label>
+            <select id="fromLang">
+                <option value="zh">Chinese</option>
+                <option value="ru">Russian</option>
+                <option value="en">English</option>
+            </select>
+            
+            <label style="margin-left: 20px;">To Language:</label>
+            <select id="toLang">
+                <option value="en" selected>English</option>
+                <option value="zh">Chinese</option>
+                <option value="ru">Russian</option>
+            </select>
+        </div>
+        
+        <div class="control-group" style="text-align: center; margin-top: 15px; padding-top: 15px; border-top: 1px solid #ddd;">
+            <button onclick="showOBSLink()" style="padding: 10px 20px; background: #9C27B0; color: white; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 14px;">
+                📺 Get OBS Captions Link
+            </button>
+            <div id="obsLinkContainer" style="display: none; margin-top: 10px; padding: 10px; background: #f0f0f0; border-radius: 5px;">
+                <p style="margin: 5px 0; font-weight: bold;">OBS Browser Source URL:</p>
+                <input type="text" id="obsLink" readonly style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; font-family: monospace; font-size: 12px;">
+                <button onclick="copyOBSLink()" style="margin-top: 8px; padding: 8px 16px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">
+                    📋 Copy Link
+                </button>
+                <p style="margin: 10px 0 5px 0; font-size: 12px; color: #666;">
+                    <strong>How to use in OBS:</strong><br>
+                    1. Add a &quot;Browser&quot; source in OBS<br>
+                    2. Paste the URL above<br>
+                    3. Set width: 1920, height: 200<br>
+                    4. Check &quot;Shutdown source when not visible&quot;<br>
+                    5. Captions will appear automatically!
+                </p>
+            </div>
+        </div>
+    </div>
+    
+    <div id="speakControls" style="display: none;">
+        <div class="mic-control">
+            <button class="mic-button inactive" id="micButton" onclick="toggleMicrophone()">
+                🎤 Start Speaking
+            </button>
+        </div>
+        <div class="warning" id="browserWarning" style="display: none;">
+            ⚠️ Speech recognition not available. This may be because:<br>
+            • You're using an unsupported browser (use Chrome, Edge, or Safari)<br>
+            • You're on mobile Safari without HTTPS (iOS requires secure connection)<br>
+            <br>
+            <strong>For mobile users:</strong> Access via HTTPS or use desktop browser
+        </div>
+    </div>
+    
+    <div id="typeControls" style="display: none;">
+        <div class="controls">
+            <div class="control-group">
+                <label>Type your text:</label>
+                <textarea id="typeInput" rows="4" style="width: 100%; padding: 10px; border-radius: 5px; border: 1px solid #ddd; font-size: 16px;" placeholder="Type text here and press Translate..."></textarea>
+            </div>
+            <div class="control-group" style="text-align: center; margin-top: 10px;">
+                <button onclick="translateTypedText()" style="padding: 12px 30px; background: #4CAF50; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; font-weight: bold;">
+                    🔄 Translate
+                </button>
+                <button onclick="clearTypedText()" style="padding: 12px 30px; background: #f44336; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; font-weight: bold; margin-left: 10px;">
+                    🗑️ Clear
+                </button>
+            </div>
+        </div>
+    </div>
+    
+    <div id="screenControls" style="display: none;">
+        <div class="mic-control">
+            <button class="mic-button inactive" id="screenButton" onclick="toggleScreenShare()">
+                🖥️ Start Screen Share
+            </button>
+        </div>
+        <div class="warning" id="screenWarning" style="display: none;">
+            ⚠️ Screen sharing not available or permission denied.
+        </div>
+        <div class="warning" style="background: #e3f2fd; border-color: #2196F3;">
+            ℹ️ <strong>How to use:</strong><br>
+            1. Click "Start Screen Share"<br>
+            2. Select "Chrome Tab" (not entire screen)<br>
+            3. Check "Share tab audio" checkbox<br>
+            4. Select the tab you want to capture<br>
+            5. Audio from that tab will be transcribed and translated
+        </div>
+    </div>
+    
+    <div class="text-box source-text">
+        <h2 id="sourceLabel">Source (Voice Recognition)</h2>
+        <div class="text-content" id="sourceText">Waiting for speech...</div>
+    </div>
+    
+    <div class="text-box translation-text">
+        <h2 id="translationLabel">Translation (Live)</h2>
+        <div class="text-content" id="translationText">Waiting for translation...</div>
+    </div>
+    
+    <div class="footer">
+        <p>Connected to: <strong>{{ host }}</strong></p>
+        <p id="modeStatus">Mode: Watch (viewing PC transcription)</p>
+    </div>
+    
+    <script>
+        let sourceText = '';
+        let translationText = '';
+        let currentMode = 'watch';
+        let recognition = null;
+        let isListening = false;
+        let webSourceText = '';
+        let screenStream = null;
+        let audioContext = null;
+        let mediaRecorder = null;
+        let isScreenSharing = false;
+        
+        // Initialize speech recognition
+        function initSpeechRecognition() {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            
+            // Check if we're on mobile Safari
+            const isMobileSafari = /iPhone|iPad|iPod/.test(navigator.userAgent) && /Safari/.test(navigator.userAgent);
+            const isHTTPS = window.location.protocol === 'https:';
+            
+            if (!SpeechRecognition) {
+                document.getElementById('browserWarning').style.display = 'block';
+                console.log('Speech Recognition not available');
+                console.log('User Agent:', navigator.userAgent);
+                console.log('Protocol:', window.location.protocol);
+                return null;
+            }
+            
+            // Mobile Safari requires HTTPS
+            if (isMobileSafari && !isHTTPS) {
+                document.getElementById('browserWarning').innerHTML = 
+                    '⚠️ <strong>iOS Safari requires HTTPS for speech recognition.</strong><br>' +
+                    'Please access this page via:<br>' +
+                    '• <strong>https://' + window.location.host + '</strong><br>' +
+                    '• Or use a desktop browser';
+                document.getElementById('browserWarning').style.display = 'block';
+                return null;
+            }
+            
+            try {
+                recognition = new SpeechRecognition();
+                recognition.continuous = true;
+                recognition.interimResults = true;
+                
+                // Get selected language
+                const fromLang = document.getElementById('fromLang').value;
+                recognition.lang = fromLang === 'zh' ? 'zh-CN' : fromLang === 'ru' ? 'ru-RU' : 'en-US';
+                
+                recognition.onresult = function(event) {
+                    let interimTranscript = '';
+                    let finalTranscript = '';
+                    
+                    for (let i = event.resultIndex; i < event.results.length; i++) {
+                        const transcript = event.results[i][0].transcript;
+                        if (event.results[i].isFinal) {
+                            finalTranscript += transcript + ' ';
+                        } else {
+                            interimTranscript += transcript;
+                        }
+                    }
+                    
+                    if (finalTranscript) {
+                        webSourceText += finalTranscript;
+                        document.getElementById('sourceText').textContent = webSourceText;
+                        
+                        console.log('Final transcript:', finalTranscript);
+                        console.log('Sending to server for translation...');
+                        
+                        // Send to server for translation
+                        fetch('/api/web_transcribe', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({
+                                text: finalTranscript.trim(),
+                                from_lang: document.getElementById('fromLang').value,
+                                to_lang: document.getElementById('toLang').value
+                            })
+                        })
+                        .then(response => response.json())
+                        .then(data => {
+                            console.log('Server response:', data);
+                            if (!data.success) {
+                                console.error('Translation failed:', data.error);
+                            }
+                        })
+                        .catch(error => {
+                            console.error('Failed to send transcription:', error);
+                        });
+                    } else if (interimTranscript) {
+                        document.getElementById('sourceText').textContent = webSourceText + interimTranscript;
+                    }
+                };
+                
+                recognition.onerror = function(event) {
+                    console.error('Speech recognition error:', event.error);
+                    if (event.error === 'not-allowed') {
+                        document.getElementById('browserWarning').innerHTML = 
+                            '⚠️ <strong>Microphone access denied.</strong><br>' +
+                            'Please allow microphone access in your browser settings.';
+                        document.getElementById('browserWarning').style.display = 'block';
+                        isListening = false;
+                        const button = document.getElementById('micButton');
+                        button.textContent = '🎤 Start Speaking';
+                        button.classList.remove('active');
+                        button.classList.add('inactive');
+                    } else if (event.error === 'no-speech') {
+                        // Restart if no speech detected
+                        if (isListening) {
+                            recognition.start();
+                        }
+                    }
+                };
+                
+                recognition.onend = function() {
+                    if (isListening) {
+                        recognition.start(); // Restart for continuous listening
+                    }
+                };
+                
+                return recognition;
+            } catch (error) {
+                console.error('Error initializing speech recognition:', error);
+                document.getElementById('browserWarning').style.display = 'block';
+                return null;
+            }
+        }
+        
+        // Set mode
+        function setMode(mode) {
+            currentMode = mode;
+            
+            // Update button styles
+            document.getElementById('watchMode').classList.toggle('active', mode === 'watch');
+            document.getElementById('speakMode').classList.toggle('active', mode === 'speak');
+            document.getElementById('typeMode').classList.toggle('active', mode === 'type');
+            document.getElementById('screenMode').classList.toggle('active', mode === 'screen');
+            
+            // Show/hide controls
+            document.getElementById('speakControls').style.display = mode === 'speak' ? 'block' : 'none';
+            document.getElementById('typeControls').style.display = mode === 'type' ? 'block' : 'none';
+            document.getElementById('screenControls').style.display = mode === 'screen' ? 'block' : 'none';
+            
+            // Update status
+            let statusText = '';
+            if (mode === 'watch') {
+                statusText = 'Mode: Watch (viewing PC transcription)';
+            } else if (mode === 'speak') {
+                statusText = 'Mode: Speak (using web microphone)';
+            } else if (mode === 'type') {
+                statusText = 'Mode: Type (text translation)';
+            } else if (mode === 'screen') {
+                statusText = 'Mode: Screen Share (capturing tab audio)';
+            }
+            document.getElementById('modeStatus').textContent = statusText;
+            
+            // Stop listening if switching away from speak mode
+            if (mode !== 'speak' && isListening) {
+                toggleMicrophone();
+            }
+            
+            // Stop screen sharing if switching away
+            if (mode !== 'screen' && isScreenSharing) {
+                toggleScreenShare();
+            }
+            
+            // Clear text when switching modes
+            if (mode === 'speak') {
+                webSourceText = '';
+                document.getElementById('sourceText').textContent = 'Click "Start Speaking" to begin...';
+                document.getElementById('translationText').textContent = 'Waiting for speech...';
+            } else if (mode === 'type') {
+                document.getElementById('sourceText').textContent = 'Type text and click Translate...';
+                document.getElementById('translationText').textContent = 'Translation will appear here...';
+            } else if (mode === 'screen') {
+                document.getElementById('sourceText').textContent = 'Click "Start Screen Share" to capture tab audio...';
+                document.getElementById('translationText').textContent = 'Waiting for audio...';
+            }
+        }
+        
+        // Toggle screen share
+        async function toggleScreenShare() {
+            const button = document.getElementById('screenButton');
+            
+            if (isScreenSharing) {
+                // Stop screen sharing
+                if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                    mediaRecorder.stop();
+                }
+                if (screenStream) {
+                    screenStream.getTracks().forEach(track => track.stop());
+                    screenStream = null;
+                }
+                if (audioContext) {
+                    audioContext.close();
+                    audioContext = null;
+                }
+                
+                isScreenSharing = false;
+                button.textContent = '🖥️ Start Screen Share';
+                button.classList.remove('active');
+                button.classList.add('inactive');
+                console.log('Screen sharing stopped');
+            } else {
+                // Start screen sharing
+                try {
+                    // Request screen share with audio
+                    screenStream = await navigator.mediaDevices.getDisplayMedia({
+                        video: true,
+                        audio: {
+                            echoCancellation: false,
+                            noiseSuppression: false,
+                            autoGainControl: false
+                        }
+                    });
+                    
+                    // Check if audio track exists
+                    const audioTrack = screenStream.getAudioTracks()[0];
+                    if (!audioTrack) {
+                        alert('No audio track found. Make sure to check "Share tab audio" when selecting the tab.');
+                        screenStream.getTracks().forEach(track => track.stop());
+                        return;
+                    }
+                    
+                    console.log('Screen share started with audio');
+                    
+                    // Create audio-only stream for MediaRecorder
+                    const audioStream = new MediaStream([audioTrack]);
+                    
+                    // Try different MIME types
+                    let mimeType = 'audio/webm';
+                    if (!MediaRecorder.isTypeSupported(mimeType)) {
+                        mimeType = 'audio/webm;codecs=opus';
+                        if (!MediaRecorder.isTypeSupported(mimeType)) {
+                            mimeType = 'audio/ogg;codecs=opus';
+                            if (!MediaRecorder.isTypeSupported(mimeType)) {
+                                mimeType = '';  // Let browser choose
+                            }
+                        }
+                    }
+                    
+                    console.log('Using MIME type:', mimeType || 'default');
+                    
+                    // Create AudioContext for processing
+                    const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                    const source = audioContext.createMediaStreamSource(audioStream);
+                    
+                    // Create ScriptProcessor for capturing raw audio data
+                    const bufferSize = 4096;
+                    const processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+                    
+                    let audioBuffers = [];
+                    let isProcessing = false;
+                    
+                    processor.onaudioprocess = (e) => {
+                        if (isProcessing) return;
+                        
+                        // Get audio data
+                        const inputData = e.inputBuffer.getChannelData(0);
+                        const buffer = new Float32Array(inputData);
+                        audioBuffers.push(buffer);
+                        
+                        // Process every 3 seconds worth of audio (16000 samples/sec * 3 = 48000 samples)
+                        const totalSamples = audioBuffers.reduce((sum, buf) => sum + buf.length, 0);
+                        
+                        if (totalSamples >= 48000) {
+                            isProcessing = true;
+                            
+                            // Combine all buffers
+                            const combinedBuffer = new Float32Array(totalSamples);
+                            let offset = 0;
+                            for (const buf of audioBuffers) {
+                                combinedBuffer.set(buf, offset);
+                                offset += buf.length;
+                            }
+                            
+                            // Clear buffers for next batch
+                            audioBuffers = [];
+                            
+                            console.log(`Processing ${totalSamples} audio samples (${(totalSamples/16000).toFixed(1)}s)`);
+                            
+                            // Convert Float32Array to Int16Array (WAV format)
+                            const int16Buffer = new Int16Array(combinedBuffer.length);
+                            for (let i = 0; i < combinedBuffer.length; i++) {
+                                const s = Math.max(-1, Math.min(1, combinedBuffer[i]));
+                                int16Buffer[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                            }
+                            
+                            // Create WAV file
+                            const wavBuffer = createWavFile(int16Buffer, 16000);
+                            const base64Audio = arrayBufferToBase64(wavBuffer);
+                            
+                            console.log(`Sending WAV audio to server (${wavBuffer.byteLength} bytes)...`);
+                            
+                            fetch('/api/screen_audio', {
+                                method: 'POST',
+                                headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify({
+                                    audio: base64Audio,
+                                    from_lang: document.getElementById('fromLang').value,
+                                    to_lang: document.getElementById('toLang').value,
+                                    mime_type: 'audio/wav',
+                                    is_wav: true
+                                })
+                            })
+                            .then(response => response.json())
+                            .then(data => {
+                                console.log('Server response:', data);
+                                if (data.text) {
+                                    // Accumulate source text
+                                    const currentSource = document.getElementById('sourceText').textContent;
+                                    if (currentSource.includes('Click "Start Screen Share"') || currentSource.includes('Waiting')) {
+                                        document.getElementById('sourceText').textContent = data.text;
+                                    } else {
+                                        document.getElementById('sourceText').textContent = currentSource + ' ' + data.text;
+                                    }
+                                }
+                                if (data.error) {
+                                    console.error('Server error:', data.error);
+                                }
+                                isProcessing = false;
+                            })
+                            .catch(error => {
+                                console.error('Error sending audio:', error);
+                                isProcessing = false;
+                            });
+                        }
+                    };
+                    
+                    // Connect audio pipeline
+                    source.connect(processor);
+                    processor.connect(audioContext.destination);
+                    
+                    // Helper function to create WAV file
+                    function createWavFile(samples, sampleRate) {
+                        const buffer = new ArrayBuffer(44 + samples.length * 2);
+                        const view = new DataView(buffer);
+                        
+                        // WAV header
+                        writeString(view, 0, 'RIFF');
+                        view.setUint32(4, 36 + samples.length * 2, true);
+                        writeString(view, 8, 'WAVE');
+                        writeString(view, 12, 'fmt ');
+                        view.setUint32(16, 16, true); // fmt chunk size
+                        view.setUint16(20, 1, true); // PCM format
+                        view.setUint16(22, 1, true); // mono
+                        view.setUint32(24, sampleRate, true);
+                        view.setUint32(28, sampleRate * 2, true); // byte rate
+                        view.setUint16(32, 2, true); // block align
+                        view.setUint16(34, 16, true); // bits per sample
+                        writeString(view, 36, 'data');
+                        view.setUint32(40, samples.length * 2, true);
+                        
+                        // Write samples
+                        const offset = 44;
+                        for (let i = 0; i < samples.length; i++) {
+                            view.setInt16(offset + i * 2, samples[i], true);
+                        }
+                        
+                        return buffer;
+                    }
+                    
+                    function writeString(view, offset, string) {
+                        for (let i = 0; i < string.length; i++) {
+                            view.setUint8(offset + i, string.charCodeAt(i));
+                        }
+                    }
+                    
+                    function arrayBufferToBase64(buffer) {
+                        let binary = '';
+                        const bytes = new Uint8Array(buffer);
+                        for (let i = 0; i < bytes.byteLength; i++) {
+                            binary += String.fromCharCode(bytes[i]);
+                        }
+                        return btoa(binary);
+                    }
+                    
+                    // Store references for cleanup
+                    mediaRecorder = { 
+                        stop: () => {
+                            processor.disconnect();
+                            source.disconnect();
+                            audioContext.close();
+                            console.log('Audio processing stopped');
+                        },
+                        state: 'recording'
+                    };
+                    
+                    isScreenSharing = true;
+                    button.textContent = '🛑 Stop Screen Share';
+                    button.classList.remove('inactive');
+                    button.classList.add('active');
+                    
+                    // Handle stream end (user stops sharing)
+                    screenStream.getVideoTracks()[0].onended = () => {
+                        console.log('Screen share ended by user');
+                        if (isScreenSharing) {
+                            toggleScreenShare();
+                        }
+                    };
+                    
+                } catch (error) {
+                    console.error('Screen share error:', error);
+                    document.getElementById('screenWarning').textContent = 
+                        '⚠️ ' + (error.message || 'Screen sharing failed. Make sure to allow screen sharing and select "Share tab audio".');
+                    document.getElementById('screenWarning').style.display = 'block';
+                }
+            }
+        }
+        
+        // Translate typed text
+        function translateTypedText() {
+            const text = document.getElementById('typeInput').value.trim();
+            
+            if (!text) {
+                alert('Please enter some text to translate');
+                return;
+            }
+            
+            // Show source text
+            document.getElementById('sourceText').textContent = text;
+            document.getElementById('translationText').textContent = 'Translating...';
+            
+            // Send to server for translation
+            fetch('/api/web_transcribe', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    text: text,
+                    from_lang: document.getElementById('fromLang').value,
+                    to_lang: document.getElementById('toLang').value
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    // Translation will be fetched by updateDisplay
+                    console.log('Translation queued');
+                } else {
+                    document.getElementById('translationText').textContent = 'Translation error: ' + (data.error || 'Unknown error');
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                document.getElementById('translationText').textContent = 'Connection error';
+            });
+        }
+        
+        // Clear typed text
+        function clearTypedText() {
+            document.getElementById('typeInput').value = '';
+            document.getElementById('sourceText').textContent = 'Type text and click Translate...';
+            document.getElementById('translationText').textContent = 'Translation will appear here...';
+        }
+        
+        // Allow Enter key to translate (Shift+Enter for new line)
+        document.addEventListener('DOMContentLoaded', function() {
+            const typeInput = document.getElementById('typeInput');
+            if (typeInput) {
+                typeInput.addEventListener('keydown', function(e) {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        translateTypedText();
+                    }
+                });
+            }
+        });
+        
+        // Toggle microphone
+        function toggleMicrophone() {
+            if (!recognition) {
+                recognition = initSpeechRecognition();
+                if (!recognition) return;
+            }
+            
+            const button = document.getElementById('micButton');
+            
+            if (isListening) {
+                recognition.stop();
+                isListening = false;
+                button.textContent = '🎤 Start Speaking';
+                button.classList.remove('active');
+                button.classList.add('inactive');
+            } else {
+                // Update language before starting
+                const fromLang = document.getElementById('fromLang').value;
+                recognition.lang = fromLang === 'zh' ? 'zh-CN' : fromLang === 'ru' ? 'ru-RU' : 'en-US';
+                
+                recognition.start();
+                isListening = true;
+                button.textContent = '🛑 Stop Speaking';
+                button.classList.remove('inactive');
+                button.classList.add('active');
+                webSourceText = '';
+            }
+        }
+        
+        // Update display
+        function updateDisplay() {
+            if (currentMode === 'watch') {
+                // Watch mode - get data from PC
+                fetch('/api/status')
+                    .then(response => response.json())
+                    .then(data => {
+                        document.getElementById('status').textContent = data.status;
+                        document.getElementById('status').style.background = data.is_running ? '#4CAF50' : '#f44336';
+                        
+                        // Update source text if changed
+                        if (data.source_text && data.source_text !== sourceText) {
+                            sourceText = data.source_text;
+                            document.getElementById('sourceText').textContent = sourceText;
+                        }
+                        
+                        // Update translation if changed
+                        if (data.translation_text && data.translation_text !== translationText) {
+                            translationText = data.translation_text;
+                            document.getElementById('translationText').textContent = translationText;
+                        }
+                        
+                        // Update labels
+                        document.getElementById('sourceLabel').textContent = 
+                            data.from_language + ' (Voice Recognition)';
+                        document.getElementById('translationLabel').textContent = 
+                            data.to_language + ' (Live Translation)';
+                    })
+                    .catch(error => {
+                        console.error('Error:', error);
+                        document.getElementById('status').textContent = 'Connection error';
+                        document.getElementById('status').style.background = '#f44336';
+                    });
+            } else if (currentMode === 'speak' || currentMode === 'type' || currentMode === 'screen') {
+                // Speak/Type/Screen mode - get translation from server
+                fetch('/api/web_translation')
+                    .then(response => response.json())
+                    .then(data => {
+                        // Always update translation if available
+                        if (data.translation) {
+                            document.getElementById('translationText').textContent = data.translation;
+                        }
+                        // Update source text for screen mode
+                        if (currentMode === 'screen' && data.source) {
+                            const sourceBox = document.getElementById('sourceText');
+                            const currentText = sourceBox.textContent;
+                            // Only update if it's different and not empty
+                            if (data.source && data.source !== currentText && !currentText.includes('Click "Start Screen Share"')) {
+                                sourceBox.textContent = data.source;
+                            }
+                        }
+                    })
+                    .catch(error => console.error('Translation error:', error));
+            }
+        }
+        
+        // Update every 500ms
+        setInterval(updateDisplay, 500);
+        updateDisplay();
+        
+        // Language change handlers
+        document.getElementById('fromLang').addEventListener('change', function() {
+            if (currentMode === 'watch') {
+                fetch('/api/set_language', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        from: this.value,
+                        to: document.getElementById('toLang').value
+                    })
+                });
+            } else {
+                // Update speech recognition language
+                if (recognition && isListening) {
+                    recognition.stop();
+                    isListening = false;
+                    setTimeout(() => {
+                        toggleMicrophone();
+                    }, 100);
+                }
+            }
+        });
+        
+        document.getElementById('toLang').addEventListener('change', function() {
+            if (currentMode === 'watch') {
+                fetch('/api/set_language', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        from: document.getElementById('fromLang').value,
+                        to: this.value
+                    })
+                });
+            }
+        });
+        
+        // OBS Captions Link Functions
+        function showOBSLink() {
+            const container = document.getElementById('obsLinkContainer');
+            const input = document.getElementById('obsLink');
+            
+            // Generate the OBS link
+            const protocol = window.location.protocol;
+            const host = window.location.host;
+            const obsUrl = protocol + '//' + host + '/obs-captions';
+            
+            input.value = obsUrl;
+            container.style.display = 'block';
+        }
+        
+        function copyOBSLink() {
+            const input = document.getElementById('obsLink');
+            input.select();
+            input.setSelectionRange(0, 99999); // For mobile
+            
+            try {
+                document.execCommand('copy');
+                alert('OBS link copied to clipboard! ✓\\n\\nPaste it into OBS Browser source.');
+            } catch (err) {
+                alert('Failed to copy. Please manually copy the link.');
+            }
+        }
+    </script>
+</body>
+</html>
+        '''
+        
+        @app.route('/')
+        def index():
+            return render_template_string(HTML_TEMPLATE, host=request.host)
+        
+        @app.route('/obs-captions')
+        def obs_captions():
+            """OBS Browser Source page - shows only translation text"""
+            OBS_TEMPLATE = '''
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <title>OBS Captions</title>
+                <style>
+                    body {
+                        margin: 0;
+                        padding: 20px;
+                        background: transparent;
+                        font-family: Arial, sans-serif;
+                        overflow: hidden;
+                    }
+                    #captions {
+                        color: white;
+                        font-size: 32px;
+                        font-weight: bold;
+                        text-align: center;
+                        text-shadow: 2px 2px 4px rgba(0,0,0,0.8),
+                                   -1px -1px 2px rgba(0,0,0,0.8),
+                                    1px -1px 2px rgba(0,0,0,0.8),
+                                   -1px 1px 2px rgba(0,0,0,0.8);
+                        line-height: 1.4;
+                        word-wrap: break-word;
+                    }
+                </style>
+            </head>
+            <body>
+                <div id="captions">Waiting for translation...</div>
+                
+                <script>
+                    let lastTranslation = '';
+                    
+                    async function updateCaptions() {
+                        try {
+                            const response = await fetch('/api/obs-translation');
+                            const data = await response.json();
+                            
+                            if (data.translation && data.translation !== lastTranslation) {
+                                document.getElementById('captions').textContent = data.translation;
+                                lastTranslation = data.translation;
+                            }
+                        } catch (error) {
+                            console.error('Error fetching captions:', error);
+                        }
+                    }
+                    
+                    // Update every 200ms for smooth captions
+                    setInterval(updateCaptions, 200);
+                    updateCaptions();
+                </script>
+            </body>
+            </html>
+            '''
+            return render_template_string(OBS_TEMPLATE)
+        
+        @app.route('/api/obs-translation')
+        def api_obs_translation():
+            """Get current translation for OBS"""
+            # Get translation from queue or stored value
+            translation = ""
+            try:
+                if not web_translation_queue.empty():
+                    translation = web_translation_queue.get_nowait()
+                elif web_current_translation:
+                    translation = web_current_translation
+            except:
+                pass
+            
+            # Also check PC translation if web is not active
+            if not translation and not self.web_is_active:
+                translation = self.english_text.get(1.0, tk.END).strip()
+            
+            return jsonify({'translation': translation})
+        
+        @app.route('/api/status')
+        def api_status():
+            """Get current status and text"""
+            from_index = self.from_language_combo.current()
+            to_index = self.to_language_combo.current()
+            
+            from_lang = self.languages[from_index]["name"] if from_index >= 0 else "Chinese"
+            to_lang = self.languages[to_index]["name"] if to_index >= 0 else "English"
+            
+            return jsonify({
+                'status': self.status_label.cget('text'),
+                'is_running': self.is_running,
+                'source_text': self.accumulated_text,
+                'translation_text': self.english_text.get(1.0, tk.END).strip(),
+                'from_language': from_lang,
+                'to_language': to_lang
+            })
+        
+        @app.route('/api/set_language', methods=['POST'])
+        def api_set_language():
+            """Change language settings"""
+            data = request.json
+            from_code = data.get('from', 'zh')
+            to_code = data.get('to', 'en')
+            
+            # Find indices
+            from_idx = next((i for i, lang in enumerate(self.languages) if lang['code'] == from_code), 0)
+            to_idx = next((i for i, lang in enumerate(self.languages) if lang['code'] == to_code), 2)
+            
+            # Update UI (must be done in main thread)
+            self.root.after(0, lambda: self.from_language_combo.current(from_idx))
+            self.root.after(0, lambda: self.to_language_combo.current(to_idx))
+            self.root.after(0, self.on_language_change)
+            
+            return jsonify({'success': True})
+        
+        @app.route('/api/web_transcribe', methods=['POST'])
+        def api_web_transcribe():
+            """Receive transcription from web microphone and translate"""
+            data = request.json
+            text = data.get('text', '')
+            from_lang = data.get('from_lang', 'zh')
+            to_lang = data.get('to_lang', 'en')
+            
+            if not text:
+                return jsonify({'success': False, 'error': 'No text provided'})
+            
+            print(f"Web transcription received: '{text}'")
+            
+            # Queue for translation
+            try:
+                web_audio_queue.put_nowait({
+                    'text': text,
+                    'from_lang': from_lang,
+                    'to_lang': to_lang
+                })
+                return jsonify({'success': True})
+            except queue.Full:
+                return jsonify({'success': False, 'error': 'Queue full'})
+        
+        @app.route('/api/web_translation')
+        def api_web_translation():
+            """Get latest web translation"""
+            try:
+                global web_current_translation, web_current_source
+                
+                # Try to get latest from queue first
+                translation = web_current_translation
+                while not web_translation_queue.empty():
+                    try:
+                        translation = web_translation_queue.get_nowait()
+                        web_current_translation = translation  # Update global
+                    except queue.Empty:
+                        break
+                
+                return jsonify({
+                    'translation': translation,
+                    'source': web_current_source
+                })
+            except Exception as e:
+                return jsonify({'translation': '', 'source': '', 'error': str(e)})
+        
+        @app.route('/api/screen_audio', methods=['POST'])
+        def api_screen_audio():
+            """Receive screen share audio and transcribe"""
+            try:
+                data = request.json
+                audio_base64 = data.get('audio', '')
+                from_lang = data.get('from_lang', 'zh')
+                to_lang = data.get('to_lang', 'en')
+                is_wav = data.get('is_wav', False)
+                
+                if not audio_base64:
+                    return jsonify({'success': False, 'error': 'No audio data'})
+                
+                print(f"Received screen audio ({'WAV' if is_wav else 'WebM'}), processing...")
+                
+                # Decode base64 audio
+                audio_bytes = base64.b64decode(audio_base64)
+                print(f"Decoded audio: {len(audio_bytes)} bytes")
+                
+                if is_wav:
+                    # Audio is already in WAV format from browser, load directly
+                    print("Loading WAV audio directly (no FFmpeg needed)...")
+                    try:
+                        import wave
+                        import io
+                        
+                        # Load WAV from bytes
+                        wav_io = io.BytesIO(audio_bytes)
+                        with wave.open(wav_io, 'rb') as wf:
+                            # Verify it's the right format
+                            channels = wf.getnchannels()
+                            sample_rate = wf.getframerate()
+                            sample_width = wf.getsampwidth()
+                            
+                            print(f"WAV format: {channels} channels, {sample_rate}Hz, {sample_width} bytes/sample")
+                            
+                            # Read audio data
+                            audio_data = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+                            audio_float = audio_data.astype(np.float32) / 32768.0
+                        
+                        print(f"Audio loaded: {len(audio_float)} samples ({len(audio_float)/sample_rate:.1f}s)")
+                        
+                    except Exception as wav_err:
+                        print(f"Error loading WAV: {wav_err}")
+                        import traceback
+                        traceback.print_exc()
+                        return jsonify({'success': False, 'error': f'Failed to load WAV: {str(wav_err)}'})
+                else:
+                    # Old WebM path (kept for compatibility, but shouldn't be used anymore)
+                    print("WARNING: Received WebM format, this path is deprecated")
+                    return jsonify({'success': False, 'error': 'WebM format no longer supported, please refresh page'})
+                
+                # Transcribe the audio
+                if self.model:
+                    print("Starting transcription...")
+                    try:
+                        segments, info = self.model.transcribe(
+                            audio_float,
+                            language=from_lang,
+                            beam_size=5,
+                            temperature=0.0,
+                            vad_filter=True
+                        )
+                        
+                        transcribed_text = ""
+                        for segment in segments:
+                            transcribed_text += segment.text + " "
+                        
+                        transcribed_text = transcribed_text.strip()
+                        
+                        if transcribed_text:
+                            print(f"Screen audio transcribed: '{transcribed_text}'")
+                            
+                            # Queue for translation with screen flag
+                            try:
+                                web_audio_queue.put_nowait({
+                                    'text': transcribed_text,
+                                    'from_lang': from_lang,
+                                    'to_lang': to_lang,
+                                    'is_screen': True
+                                })
+                                print(f"Queued for translation successfully")
+                            except queue.Full:
+                                print(f"Warning: web_audio_queue is full, clearing old items")
+                                while not web_audio_queue.empty():
+                                    try:
+                                        web_audio_queue.get_nowait()
+                                    except queue.Empty:
+                                        break
+                                web_audio_queue.put_nowait({
+                                    'text': transcribed_text,
+                                    'from_lang': from_lang,
+                                    'to_lang': to_lang,
+                                    'is_screen': True
+                                })
+                            
+                            return jsonify({'success': True, 'text': transcribed_text})
+                        else:
+                            print("No text transcribed (silence or no speech)")
+                            return jsonify({'success': True, 'text': '', 'message': 'No speech detected'})
+                    
+                    except Exception as transcribe_err:
+                        print(f"Transcription error: {transcribe_err}")
+                        import traceback
+                        traceback.print_exc()
+                        return jsonify({'success': False, 'error': f'Transcription failed: {str(transcribe_err)}'})
+                else:
+                    print("Model not loaded yet")
+                    return jsonify({'success': False, 'error': 'Model not loaded'})
+                
+            except Exception as e:
+                print(f"Screen audio error: {e}")
+                import traceback
+                traceback.print_exc()
+                return jsonify({'success': False, 'error': str(e)})
+        
+        @app.route('/shutdown', methods=['POST'])
+        def shutdown():
+            """Shutdown the Flask server"""
+            print("Shutdown request received")
+            func = request.environ.get('werkzeug.server.shutdown')
+            if func is None:
+                # For production servers, just return success
+                # The server will stop when self.web_server_enabled becomes False
+                return jsonify({'success': True, 'message': 'Shutdown signal sent'})
+            func()
+            return jsonify({'success': True, 'message': 'Server shutting down...'})
+        
+        try:
+            print("Starting HTTP server on http://0.0.0.0:1235")
+            # Run with threaded=True to allow shutdown
+            app.run(host='0.0.0.0', port=1235, debug=False, use_reloader=False, threaded=True)
+        except Exception as e:
+            print(f"Web server error: {e}")
+        finally:
+            self.web_server_enabled = False
+            print("Web server thread ended")
+
     def cleanup(self):
         """Cleanup resources"""
         try:
             print("Cleaning up resources...")
             self.is_running = False
+            
+            # Stop web server
+            if self.web_server_enabled:
+                self.stop_web_server()
             
             if hasattr(self, 'stream') and self.stream is not None:
                 try:
