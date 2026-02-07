@@ -2606,7 +2606,11 @@ class RealtimeTranslator:
                     let isProcessing = false;
                     
                     processor.onaudioprocess = (e) => {
-                        if (isProcessing) return;
+                        // If processing, skip this chunk to prevent memory buildup
+                        if (isProcessing) {
+                            console.log('Skipping audio chunk (still processing previous)');
+                            return;
+                        }
                         
                         // Get audio data
                         const inputData = e.inputBuffer.getChannelData(0);
@@ -2615,6 +2619,12 @@ class RealtimeTranslator:
                         
                         // Process every 3 seconds worth of audio (16000 samples/sec * 3 = 48000 samples)
                         const totalSamples = audioBuffers.reduce((sum, buf) => sum + buf.length, 0);
+                        
+                        // Also prevent buffer from growing too large (max 5 seconds)
+                        if (totalSamples > 80000) {
+                            console.warn('Audio buffer overflow, clearing old data');
+                            audioBuffers = audioBuffers.slice(-10); // Keep only last 10 chunks
+                        }
                         
                         if (totalSamples >= 48000) {
                             isProcessing = true;
@@ -2627,7 +2637,7 @@ class RealtimeTranslator:
                                 offset += buf.length;
                             }
                             
-                            // Clear buffers for next batch
+                            // Clear buffers for next batch IMMEDIATELY
                             audioBuffers = [];
                             
                             console.log(`Processing ${totalSamples} audio samples (${(totalSamples/16000).toFixed(1)}s)`);
@@ -2980,6 +2990,7 @@ class RealtimeTranslator:
             return render_template_string(HTML_TEMPLATE, host=request.host)
         
         @app.route('/obs-captions')
+        @app.route('/obs-captions/')
         def obs_captions():
             """OBS Browser Source page - shows only translation text"""
             OBS_TEMPLATE = '''
